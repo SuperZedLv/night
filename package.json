@@ -1,0 +1,13 @@
+{
+    "dependencies": {
+        "axios": "^1.13.1",
+        "puppeteer": "^24.27.0"
+    },
+    "scripts": {
+        "start": "node runbatch.mjs"
+    },
+    "type": "module",
+    "devDependencies": {
+        "playwright": "^1.56.1"
+    }
+}
