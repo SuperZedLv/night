@@ -1,13 +1,13 @@
 // run-batch.js
 import { chromium } from 'playwright';
-import { readFileSync } from 'fs';
+import { readFileSync, statSync, readdirSync } from 'fs';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
+import { dirname, join, extname } from 'path';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const CONCURRENCY = parseInt(process.env.CONCURRENCY) || 4; // 并发数（可通过环境变量配置）
+const CONCURRENCY = parseInt(process.env.CONCURRENCY) || 5; // 并发数（可通过环境变量配置）
 const TASK_TIMEOUT_MS = 120_000;
 export const BASE_URL = 'https://sm.midnight.gd/wizard/mine'; // 目标网页
 
@@ -183,6 +183,26 @@ async function checkIfErrorPage(page) {
     // 检查是否是 429 错误页面
     if (currentUrl.includes('/error?code=429') || (currentUrl.includes('/error') && currentUrl.includes('429'))) {
       return { isErrorPage: true, errorCode: '429', url: currentUrl };
+    }
+    // 检查是否是 403 错误页面
+    if (currentUrl.includes('/error?code=403') || (currentUrl.includes('/error') && currentUrl.includes('403'))) {
+      return { isErrorPage: true, errorCode: '403', url: currentUrl };
+    }
+    // 检查页面内容中是否显示403错误
+    try {
+      const pageText = await page.textContent('body').catch(() => '');
+      if (pageText && /403|forbidden/i.test(pageText)) {
+        // 检查是否在错误页面元素中
+        const errorElements = await page.locator('[role="alert"], .error, .error-message, [class*="error"]').all().catch(() => []);
+        for (const el of errorElements) {
+          const text = await el.textContent().catch(() => '');
+          if (text && /403|forbidden/i.test(text)) {
+            return { isErrorPage: true, errorCode: '403', url: currentUrl };
+          }
+        }
+      }
+    } catch (e) {
+      // 忽略检查错误
     }
     // 检查是否是其他错误页面（如 /wizard/t-c）
     if (currentUrl.includes('/wizard/t-c') || currentUrl.includes('/error')) {
@@ -793,19 +813,20 @@ async function handleErrorPage(page, targetUrl = BASE_URL) {
     return false; // 不是错误页面
   }
   
-  // 429 错误页面：使用 Disconnect 重置
-  if (errorPageCheck.errorCode === '429') {
-    console.warn(`[429-ERROR] Detected 429 error page at ${errorPageCheck.url}`);
-    console.log(`[429-ERROR] Attempting to reset via Disconnect...`);
+  // 429 或 403 错误页面：使用 Disconnect 重置
+  if (errorPageCheck.errorCode === '429' || errorPageCheck.errorCode === '403') {
+    const errorType = errorPageCheck.errorCode === '429' ? '429' : '403';
+    console.warn(`[${errorType}-ERROR] Detected ${errorType} error page at ${errorPageCheck.url}`);
+    console.log(`[${errorType}-ERROR] Attempting to reset via Disconnect...`);
     
-    // 429 错误页面需要使用 Disconnect 重置
+    // 429/403 错误页面需要使用 Disconnect 重置
     const reset = await disconnectAndReset(page);
     if (reset) {
       return true;
     }
     
     // 如果 Disconnect 失败，尝试直接导航
-    console.warn(`[429-ERROR] Disconnect reset failed, trying direct navigation...`);
+    console.warn(`[${errorType}-ERROR] Disconnect reset failed, trying direct navigation...`);
     try {
       await page.goto(targetUrl, {
         waitUntil: 'domcontentloaded',
@@ -814,13 +835,13 @@ async function handleErrorPage(page, targetUrl = BASE_URL) {
       await page.waitForTimeout(2000);
       return true;
     } catch (e) {
-      console.error(`[429-ERROR] Navigation also failed: ${e.message}`);
+      console.error(`[${errorType}-ERROR] Navigation also failed: ${e.message}`);
       return false;
     }
   }
   
   // 其他错误页面（如 /wizard/t-c）：直接导航回去，不使用 Disconnect
-  console.warn(`[ERROR-PAGE] Detected error page (non-429) at ${errorPageCheck.url}`);
+  console.warn(`[ERROR-PAGE] Detected error page (non-429/403) at ${errorPageCheck.url}`);
   console.log(`[ERROR-PAGE] Navigating back to ${targetUrl}...`);
   
   try {
@@ -973,6 +994,7 @@ async function gotoWithRateLimit(page, url, options = {}) {
         const result = await retryWithBackoff(
           async () => {
             console.log(`[NAV] Navigating to ${url}...`);
+  
             
             // 只监听主页面 URL 的响应错误（忽略 API 请求）
             let mainPageResponseError = null;
@@ -1048,11 +1070,16 @@ async function gotoWithRateLimit(page, url, options = {}) {
               // 等待页面加载完成
               await page.waitForTimeout(1000); // 等待页面渲染
               
-              // 检查是否被重定向到429错误页面
+              // 检查是否被重定向到错误页面（429或403）
               const errorPageCheck = await checkIfErrorPage(page);
-              if (errorPageCheck.isErrorPage && errorPageCheck.errorCode === '429') {
-                console.warn(`[NAV] Redirected to 429 error page: ${errorPageCheck.url}`);
-                throw new Error(`429 error page detected: redirected to ${errorPageCheck.url}`);
+              if (errorPageCheck.isErrorPage) {
+                if (errorPageCheck.errorCode === '429') {
+                  console.warn(`[NAV] Redirected to 429 error page: ${errorPageCheck.url}`);
+                  throw new Error(`429 error page detected: redirected to ${errorPageCheck.url}`);
+                } else if (errorPageCheck.errorCode === '403') {
+                  console.warn(`[NAV] Redirected to 403 error page: ${errorPageCheck.url}`);
+                  throw new Error(`403 error page detected: redirected to ${errorPageCheck.url}`);
+                }
               }
               
               // 只在页面稳定时检查错误（避免在导航时检查）
@@ -1454,25 +1481,70 @@ async function signWithRateLimit(addr, hex, retries = 5) {
   throw new Error('Sign request failed after all retries');
 }
 
-// 从 JSON 文件加载任务列表
-const TASKS_FILE = process.env.TASKS_FILE || join(__dirname, 'tasks.json');
+// 从 JSON 文件或文件夹加载任务列表
+// ⚠️ 默认从项目根目录下的 task 文件夹读取任务列表
+// 如果路径指向文件夹，会读取文件夹中所有 .json 文件并合并
+// 如果路径指向文件，则直接读取该文件
+const TASKS_PATH = process.env.TASKS_FILE || join(__dirname, '..', 'task');
 
 function loadTasks() {
   try {
-    console.log(`[CONFIG] Loading tasks from: ${TASKS_FILE}`);
-    const fileContent = readFileSync(TASKS_FILE, 'utf8');
-    const data = JSON.parse(fileContent);
+    const stats = statSync(TASKS_PATH);
+    let allTasks = [];
+    let loadedFiles = [];
     
-    // 支持两种格式：直接是数组，或者包装在 tasks 属性中
-    const tasks = Array.isArray(data) ? data : (data.tasks || []);
-    
-    if (!Array.isArray(tasks) || tasks.length === 0) {
-      throw new Error('Tasks file must contain a non-empty array of tasks');
+    if (stats.isDirectory()) {
+      // 如果是文件夹，读取文件夹中所有 .json 文件
+      console.log(`[CONFIG] Loading tasks from directory: ${TASKS_PATH}`);
+      const files = readdirSync(TASKS_PATH).filter(f => extname(f).toLowerCase() === '.json');
+      
+      if (files.length === 0) {
+        throw new Error(`No JSON files found in directory: ${TASKS_PATH}`);
+      }
+      
+      for (const file of files) {
+        const filePath = join(TASKS_PATH, file);
+        try {
+          const fileContent = readFileSync(filePath, 'utf8');
+          const data = JSON.parse(fileContent);
+          // 支持两种格式：直接是数组，或者包装在 tasks 属性中
+          const tasks = Array.isArray(data) ? data : (data.tasks || []);
+          
+          if (Array.isArray(tasks) && tasks.length > 0) {
+            allTasks = allTasks.concat(tasks);
+            loadedFiles.push(`${file} (${tasks.length} tasks)`);
+            console.log(`[CONFIG]   ✓ Loaded ${tasks.length} task(s) from ${file}`);
+          }
+        } catch (err) {
+          console.warn(`[CONFIG]   ⚠️ Failed to load ${file}: ${err.message}`);
+        }
+      }
+      
+      if (allTasks.length === 0) {
+        throw new Error(`No valid tasks found in any JSON file in directory: ${TASKS_PATH}`);
+      }
+      
+      console.log(`[CONFIG] Loaded ${allTasks.length} task(s) from ${loadedFiles.length} file(s)`);
+    } else if (stats.isFile()) {
+      // 如果是文件，直接读取
+      console.log(`[CONFIG] Loading tasks from file: ${TASKS_PATH}`);
+      const fileContent = readFileSync(TASKS_PATH, 'utf8');
+      const data = JSON.parse(fileContent);
+      // 支持两种格式：直接是数组，或者包装在 tasks 属性中
+      allTasks = Array.isArray(data) ? data : (data.tasks || []);
+      
+      if (!Array.isArray(allTasks) || allTasks.length === 0) {
+        throw new Error('Tasks file must contain a non-empty array of tasks');
+      }
+      
+      console.log(`[CONFIG] Loaded ${allTasks.length} task(s) from ${TASKS_PATH}`);
+    } else {
+      throw new Error(`Path is neither a file nor a directory: ${TASKS_PATH}`);
     }
     
     // 验证每个任务都有必需的字段
-    for (let i = 0; i < tasks.length; i++) {
-      const task = tasks[i];
+    for (let i = 0; i < allTasks.length; i++) {
+      const task = allTasks[i];
       if (!task.id) {
         throw new Error(`Task at index ${i} is missing required field 'id'`);
       }
@@ -1481,15 +1553,15 @@ function loadTasks() {
       }
     }
     
-    console.log(`[CONFIG] Loaded ${tasks.length} task(s) from ${TASKS_FILE}`);
-    return tasks;
+    return allTasks;
   } catch (error) {
     if (error.code === 'ENOENT') {
-      console.error(`[ERROR] Tasks file not found: ${TASKS_FILE}`);
-      console.error(`[ERROR] Please create a tasks.json file or set TASKS_FILE environment variable`);
+      console.error(`[ERROR] Tasks path not found: ${TASKS_PATH}`);
+      console.error(`[ERROR] Please create a task directory or file, or set TASKS_FILE environment variable`);
       console.error(`[ERROR] Example: TASKS_FILE=./my-tasks.json node runbatch.mjs`);
+      console.error(`[ERROR] Example: TASKS_FILE=./task node runbatch.mjs`);
     } else {
-      console.error(`[ERROR] Failed to load tasks from ${TASKS_FILE}:`, error.message);
+      console.error(`[ERROR] Failed to load tasks from ${TASKS_PATH}:`, error.message);
     }
     process.exit(1);
   }
@@ -1506,6 +1578,19 @@ async function runOneInitOnly(task, scheduler = null) {
 
 async function runOne(task, options = {}) {
   const { initOnly = false, scheduler = null } = options;
+  
+  // ⚠️ 记录任务开始时间（页面打开时间），任务进入"登录阶段"
+  const taskId = task.id;
+  if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+    if (!taskStats.taskTimers.has(taskId)) {
+      taskStats.taskTimers.set(taskId, { pageOpenTime: Date.now() });
+    } else {
+      taskStats.taskTimers.get(taskId).pageOpenTime = Date.now();
+    }
+    taskStats.loggingIn++;
+    console.log(`[STATS] 🔐 Task ${taskId} started (logging in, Logging In: ${taskStats.loggingIn})`);
+  }
+  
   // 支持 headless 模式（可通过环境变量控制）
   const HEADLESS = process.env.HEADLESS !== 'false'; // 默认 headless 模式
   const DISPLAY = process.env.DISPLAY || ':99';
@@ -1744,17 +1829,18 @@ async function runOne(task, options = {}) {
     // 等待页面加载稳定后再检查
     await page.waitForTimeout(2000);
     
-    // 首先检查是否被重定向到 429 错误页面（只有 429 才需要 disconnect）
+    // 首先检查是否被重定向到错误页面（429或403需要 disconnect）
     const errorPageCheck = await checkIfErrorPage(page);
-    if (errorPageCheck.isErrorPage && errorPageCheck.errorCode === '429') {
-      console.warn(`[429-ERROR] Detected 429 error page after navigation: ${errorPageCheck.url}`);
+    if (errorPageCheck.isErrorPage && (errorPageCheck.errorCode === '429' || errorPageCheck.errorCode === '403')) {
+      const errorType = errorPageCheck.errorCode;
+      console.warn(`[${errorType}-ERROR] Detected ${errorType} error page after navigation: ${errorPageCheck.url}`);
       const handled = await handleErrorPage(page, BASE_URL);
       if (handled) {
         await page.waitForTimeout(2000);
         // 如果成功重置，可能需要从头开始，但先检查页面状态
         const isReset = await page.getByText('Enter an address manually', { exact: true }).isVisible({ timeout: 3000 }).catch(() => false);
         if (isReset) {
-          console.log('[429-ERROR] Page reset successful, will continue from beginning...');
+          console.log(`[${errorType}-ERROR] Page reset successful, will continue from beginning...`);
         }
       }
     } else if (errorPageCheck.isErrorPage && errorPageCheck.errorCode === 'other') {
@@ -1876,106 +1962,278 @@ async function runOne(task, options = {}) {
         // 等待页面稳定后再操作（避免用户交互干扰）
         await waitForPageStable(page, 2000);
         
-        // ⚠️ 检查当前URL：如果在 /wizard/wallet 页面，需要先点击 "Enter an address manually"
+        // ⚠️ 用户要求：无论URL是什么，如果页面出现"Choose a Destination address"就填写地址继续下一步
+        // 先检查页面内容，不依赖URL
+        const pageContent = await page.evaluate(() => {
+          return (document.body?.innerText || '').toLowerCase();
+        }).catch(() => '');
+        
+        const hasChooseDestination = /choose.*destination.*address/i.test(pageContent);
+        const hasEnterAddressManually = /enter.*address.*manually/i.test(pageContent);
+        
+        // ⚠️ 检查地址输入框是否已经可见（避免重复点击按钮）
+        let addressInputVisible = false;
+        try {
+          const inputCheck1 = page.getByPlaceholder('Enter address');
+          addressInputVisible = await inputCheck1.first().isVisible({ timeout: 1000 }).catch(() => false);
+          if (!addressInputVisible) {
+            const textboxes = page.locator('input[type="text"], input:not([type]), textarea');
+            const count = await textboxes.count();
+            for (let i = 0; i < Math.min(count, 5); i++) {
+              const tb = textboxes.nth(i);
+              if (await tb.isVisible({ timeout: 500 }).catch(() => false)) {
+                const placeholder = await tb.getAttribute('placeholder').catch(() => '');
+                const ariaLabel = await tb.getAttribute('aria-label').catch(() => '');
+                if (placeholder && /address/i.test(placeholder) || ariaLabel && /address/i.test(ariaLabel)) {
+                  addressInputVisible = true;
+                  break;
+                }
+              }
+            }
+          }
+        } catch (e) {
+          // 忽略错误，继续检查
+        }
+        
+        // ⚠️ 如果页面显示"Choose a Destination address"，无论输入框是否可见，都必须点击"Enter an address manually"按钮
+        // ⚠️ 用户反馈：页面在 /wizard/wallet 或 /wizard/mine 卡在了"Choose a Destination address"子页面，没有点击"Enter an address"
         const currentUrl = page.url();
         const isWalletPage = currentUrl.includes('/wizard/wallet');
+        const isMinePage = currentUrl.includes('/wizard/mine');
+        const needsButtonClick = hasChooseDestination || isWalletPage || isMinePage || hasEnterAddressManually;
         
-        if (isWalletPage) {
-          console.log(`[WALLET-PAGE] Detected wallet page (${currentUrl}), checking for "Enter an address manually" button...`);
-          
-          // 尝试多种方式找到按钮
-          let btn = null;
-          let btnFound = false;
-          
-          // 方法1: 精确文本匹配
-          try {
-            btn = page.getByText('Enter an address manually', { exact: true });
-            btnFound = await btn.isVisible({ timeout: 3000 }).catch(() => false);
-            if (btnFound) {
-              console.log(`[WALLET-PAGE] Found "Enter an address manually" button (exact match)`);
-            }
-          } catch (e) {
-            // 继续尝试其他方法
+        // ⚠️ 只有当地址输入框真正可见且页面没有"Choose a Destination address"时，才跳过点击按钮的步骤
+        if (addressInputVisible && !hasChooseDestination) {
+          console.log(`[WALLET-PAGE] ✓ Address input already visible and no "Choose a Destination address" detected, skipping button click`);
+          // 跳过按钮点击，直接进入填写地址的步骤
+        } else {
+          // ⚠️ 如果页面显示"Choose a Destination address"，或者输入框不可见，或者是在 wallet/mine 页面，都需要点击按钮
+          if (hasChooseDestination) {
+            console.log(`[WALLET-PAGE] ⚠️ Page shows "Choose a Destination address", will click "Enter an address manually" button to proceed`);
+          } else if (!addressInputVisible) {
+            console.log(`[WALLET-PAGE] ⚠️ Address input not visible, will click button to show input`);
+          } else if (isWalletPage || isMinePage) {
+            console.log(`[WALLET-PAGE] ⚠️ On ${isWalletPage ? 'wallet' : 'mine'} page, will click button to ensure input is shown`);
           }
           
-          // 方法2: 不区分大小写匹配
-          if (!btnFound) {
+          if (needsButtonClick) {
+            console.log(`[WALLET-PAGE] Detected wallet page or "Enter an address manually" text (${currentUrl}), checking for button...`);
+            
+            // 尝试多种方式找到按钮
+            let btn = null;
+            let btnFound = false;
+            
+            // 方法1: 精确文本匹配
             try {
-              btn = page.getByText(/enter.*address.*manually/i);
-              btnFound = await btn.first().isVisible({ timeout: 3000 }).catch(() => false);
+              btn = page.getByText('Enter an address manually', { exact: true });
+              btnFound = await btn.isVisible({ timeout: 3000 }).catch(() => false);
               if (btnFound) {
-                console.log(`[WALLET-PAGE] Found "Enter an address manually" button (case-insensitive)`);
-                btn = btn.first();
+                console.log(`[WALLET-PAGE] Found "Enter an address manually" button (exact match)`);
               }
             } catch (e) {
               // 继续尝试其他方法
             }
-          }
-          
-          // 方法3: 查找包含 "manually" 的按钮
-          if (!btnFound) {
-            try {
-              const buttons = page.locator('button').filter({ hasText: /manually/i });
-              const count = await buttons.count();
-              if (count > 0) {
-                btn = buttons.first();
-                btnFound = await btn.isVisible({ timeout: 3000 }).catch(() => false);
+            
+            // 方法2: 不区分大小写匹配
+            if (!btnFound) {
+              try {
+                btn = page.getByText(/enter.*address.*manually/i);
+                btnFound = await btn.first().isVisible({ timeout: 3000 }).catch(() => false);
                 if (btnFound) {
-                  console.log(`[WALLET-PAGE] Found button with "manually" text`);
+                  console.log(`[WALLET-PAGE] Found "Enter an address manually" button (case-insensitive)`);
+                  btn = btn.first();
                 }
+              } catch (e) {
+                // 继续尝试其他方法
               }
-            } catch (e) {
-              // 继续尝试其他方法
             }
-          }
-          
-          // 方法4: 查找所有可见按钮，找到包含 "address" 和 "enter" 的
-          if (!btnFound) {
-            try {
-              const allButtons = page.locator('button');
-              const count = await allButtons.count();
-              for (let i = 0; i < Math.min(count, 20); i++) {
-                const button = allButtons.nth(i);
-                const isVisible = await button.isVisible({ timeout: 500 }).catch(() => false);
-                if (isVisible) {
-                  const text = await button.textContent().catch(() => '');
-                  if (text && /enter.*address.*manually/i.test(text)) {
-                    btn = button;
-                    btnFound = true;
-                    console.log(`[WALLET-PAGE] Found button by scanning: "${text.trim()}"`);
-                    break;
+            
+            // 方法3: 查找包含 "manually" 的按钮
+            if (!btnFound) {
+              try {
+                const buttons = page.locator('button').filter({ hasText: /manually/i });
+                const count = await buttons.count();
+                if (count > 0) {
+                  btn = buttons.first();
+                  btnFound = await btn.isVisible({ timeout: 3000 }).catch(() => false);
+                  if (btnFound) {
+                    console.log(`[WALLET-PAGE] Found button with "manually" text`);
                   }
                 }
+              } catch (e) {
+                // 继续尝试其他方法
               }
-            } catch (e) {
-              // 继续尝试默认方法
             }
-          }
-          
-          if (btnFound && btn) {
-            console.log(`[WALLET-PAGE] Clicking "Enter an address manually" button on wallet page...`);
-            await safeClick(page, btn, { timeout: 10000, force: true, retries: 3 });
-            await page.waitForTimeout(2000);
             
-            // 验证是否成功点击（页面应该变化或输入框出现）
-            const addressInput = page.getByPlaceholder('Enter address');
-            const inputVisible = await addressInput.first().isVisible({ timeout: 5000 }).catch(() => false);
-            if (inputVisible) {
-              console.log(`[WALLET-PAGE] ✓ Successfully clicked button, address input is now visible`);
+            // 方法4: 查找所有可见按钮，找到包含 "address" 和 "enter" 的
+            if (!btnFound) {
+              try {
+                const allButtons = page.locator('button');
+                const count = await allButtons.count();
+                for (let i = 0; i < Math.min(count, 50); i++) {
+                  const button = allButtons.nth(i);
+                  const isVisible = await button.isVisible({ timeout: 500 }).catch(() => false);
+                  if (isVisible) {
+                    const text = await button.textContent().catch(() => '');
+                    if (text && /enter.*address.*manually/i.test(text.trim())) {
+                      btn = button;
+                      btnFound = true;
+                      console.log(`[WALLET-PAGE] Found button by scanning: "${text.trim()}"`);
+                      break;
+                    }
+                  }
+                }
+              } catch (e) {
+                // 继续尝试默认方法
+              }
+            }
+            
+            // 方法5: 使用 CSS 选择器直接查找（基于用户提供的 HTML 结构）
+            if (!btnFound) {
+              try {
+                // 查找包含 "Enter an address manually" 文本的按钮
+                const btnBySelector = page.locator('button:has-text("Enter an address manually")');
+                const count = await btnBySelector.count();
+                if (count > 0) {
+                  for (let i = 0; i < count; i++) {
+                    const button = btnBySelector.nth(i);
+                    const isVisible = await button.isVisible({ timeout: 1000 }).catch(() => false);
+                    if (isVisible) {
+                      const text = await button.textContent().catch(() => '');
+                      if (text && text.trim() === 'Enter an address manually') {
+                        btn = button;
+                        btnFound = true;
+                        console.log(`[WALLET-PAGE] Found button by CSS selector: "${text.trim()}"`);
+                        break;
+                      }
+                    }
+                  }
+                }
+              } catch (e) {
+                console.warn(`[WALLET-PAGE] Method 5 (CSS selector) failed: ${e.message}`);
+              }
+            }
+            
+            // 方法6: 使用 page.evaluate 直接在页面中查找并点击按钮
+            if (!btnFound) {
+              try {
+                const clicked = await page.evaluate(() => {
+                  const buttons = Array.from(document.querySelectorAll('button'));
+                  for (const btn of buttons) {
+                    const text = (btn.textContent || '').trim();
+                    if (text.toLowerCase() === 'enter an address manually' || 
+                        /^enter\s+an\s+address\s+manually$/i.test(text)) {
+                      // 检查按钮是否可见且可点击
+                      const rect = btn.getBoundingClientRect();
+                      const style = window.getComputedStyle(btn);
+                      const isVisible = rect.width > 0 && rect.height > 0 && 
+                                       style.visibility !== 'hidden' &&
+                                       style.display !== 'none' &&
+                                       !btn.disabled;
+                      if (isVisible) {
+                        // 滚动到按钮位置
+                        btn.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        // 直接点击按钮
+                        btn.click();
+                        return { clicked: true, text: text };
+                      }
+                    }
+                  }
+                  return { clicked: false };
+                }).catch(() => ({ clicked: false }));
+                
+                if (clicked.clicked) {
+                  btnFound = true;
+                  // 标记为已点击，避免后续重复点击
+                  btn = { clicked: true };
+                  console.log(`[WALLET-PAGE] Found and clicked button by page.evaluate: "${clicked.text}"`);
+                  // 等待页面响应
+                  await page.waitForTimeout(1000);
+                }
+              } catch (e) {
+                console.warn(`[WALLET-PAGE] Method 6 (page.evaluate) failed: ${e.message}`);
+              }
+            }
+            
+            if (btnFound && btn && !btn.clicked) {
+              // 只有当btn是Playwright locator且未被点击时，才执行点击
+              console.log(`[WALLET-PAGE] Clicking "Enter an address manually" button on wallet page...`);
+              await safeClick(page, btn, { timeout: 10000, force: true, retries: 3 });
+            } else if (btnFound && btn && btn.clicked) {
+              // 方法6已经点击了按钮，跳过点击步骤
+              console.log(`[WALLET-PAGE] Button already clicked via page.evaluate, continuing...`);
+            }
+            
+            // ⚠️ 无论用哪种方法点击了按钮，都需要等待输入框出现并继续流程
+            if (btnFound) {
+              // ⚠️ 用户要求：点击Enter an address manually后，应该等待输入框出现并继续流程
+              // 等待输入框出现（最多等待10秒）
+              let inputVisible = false;
+              for (let waitAttempt = 0; waitAttempt < 10; waitAttempt++) {
+                await page.waitForTimeout(500);
+                try {
+                  // 尝试多种方式查找输入框
+                  const inputByPlaceholder = page.getByPlaceholder(/enter.*address/i);
+                  inputVisible = await inputByPlaceholder.first().isVisible({ timeout: 1000 }).catch(() => false);
+                  if (!inputVisible) {
+                    // 尝试通过input type查找
+                    const inputByType = page.locator('input[type="text"]');
+                    const count = await inputByType.count();
+                    for (let i = 0; i < count; i++) {
+                      const input = inputByType.nth(i);
+                      const isVisible = await input.isVisible({ timeout: 500 }).catch(() => false);
+                      if (isVisible) {
+                        const placeholder = await input.getAttribute('placeholder').catch(() => '');
+                        if (placeholder && /address/i.test(placeholder)) {
+                          inputVisible = true;
+                          break;
+                        }
+                      }
+                    }
+                  }
+                  if (inputVisible) {
+                    console.log(`[WALLET-PAGE] ✓ Address input is now visible after clicking button`);
+                    break;
+                  }
+                } catch (e) {
+                  // 继续等待
+                }
+              }
+              
+              if (!inputVisible) {
+                console.warn(`[WALLET-PAGE] ⚠️ Button clicked but address input not visible after waiting, will try to fill anyway...`);
+                // 即使输入框不可见，也尝试填写（可能已经出现但检测不到）
+                await page.waitForTimeout(1000);
+              }
             } else {
-              console.warn(`[WALLET-PAGE] Button clicked but address input not visible yet, continuing...`);
+              console.warn(`[WALLET-PAGE] "Enter an address manually" button not found on wallet/mine page, trying default method...`);
+              // 如果找不到，尝试默认方法
+              try {
+                const defaultBtn = page.getByText('Enter an address manually', { exact: true });
+                await safeClick(page, defaultBtn, { timeout: 10000, force: true, retries: 3 });
+                // 等待输入框出现
+                await page.waitForTimeout(2000);
+                console.log(`[WALLET-PAGE] ✓ Successfully clicked "Enter an address manually" button using default method`);
+              } catch (e) {
+                console.warn(`[WALLET-PAGE] ⚠️ Failed to click button using default method: ${e.message}, but continuing...`);
+                // 即使失败也继续，可能输入框已经可见
+              }
             }
           } else {
-            console.warn(`[WALLET-PAGE] "Enter an address manually" button not found on wallet page, trying default method...`);
-            // 如果找不到，尝试默认方法
-            const defaultBtn = page.getByText('Enter an address manually', { exact: true });
-            await safeClick(page, defaultBtn, { timeout: 10000, force: true, retries: 3 });
+            // 不在 wallet/mine 页面，但仍需要点击按钮（可能因为其他原因进入此分支）
+            console.log(`[WALLET-PAGE] Attempting to find and click "Enter an address manually" button using default method...`);
+            try {
+              const btn = page.getByText('Enter an address manually', { exact: true });
+              // 使用安全点击，确保即使有用户交互也能成功
+              await safeClick(page, btn, { timeout: 10000, force: true, retries: 3 });
+              // 等待输入框出现
+              await page.waitForTimeout(2000);
+              console.log(`[WALLET-PAGE] ✓ Successfully clicked "Enter an address manually" button using default method`);
+            } catch (e) {
+              console.warn(`[WALLET-PAGE] ⚠️ Failed to click button using default method: ${e.message}, but continuing...`);
+              // 即使失败也继续，可能输入框已经可见
+            }
           }
-        } else {
-          // 不在 wallet 页面，使用默认方法
-          const btn = page.getByText('Enter an address manually', { exact: true });
-          // 使用安全点击，确保即使有用户交互也能成功
-          await safeClick(page, btn, { timeout: 10000, force: true, retries: 3 });
         }
         
         // 点击后等待并检查错误
@@ -3391,6 +3649,52 @@ async function runOne(task, options = {}) {
       console.warn('[DEBUG] Start button not found within timeout, continuing...');
     });
     
+    // ⚠️ 检查是否已到达start session页面（已登录状态）
+    // 已登录状态的定义：页面显示出"Solve cryptographic challenges"且页面里包含start session或stop session按钮
+    const isLoggedInPage = await page.evaluate(() => {
+      const bodyText = (document.body?.innerText || '').toLowerCase();
+      // 检查是否显示"Solve cryptographic challenges"
+      const hasSolveCryptoText = bodyText.includes('solve cryptographic challenges');
+      
+      if (!hasSolveCryptoText) {
+        return false;
+      }
+      
+      // 检查是否有start session或stop session按钮
+      const allButtons = Array.from(document.querySelectorAll('button'));
+      const hasStartButton = allButtons.some(b => {
+        const text = b.textContent?.trim().toLowerCase();
+        return (text === 'start' || text === 'start session') && b.offsetParent !== null;
+      });
+      const hasStopButton = allButtons.some(b => {
+        const text = b.textContent?.trim().toLowerCase();
+        return (text === 'stop' || text === 'stop session') && b.offsetParent !== null;
+      });
+      
+      return hasStartButton || hasStopButton;
+    }).catch(() => false);
+    
+    if (isLoggedInPage) {
+      // 已到达start session页面（显示"Solve cryptographic challenges"且有start/stop按钮），从"登录阶段"转为"已登录状态"
+      if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+        if (taskStats.loggingIn > 0) {
+          taskStats.loggingIn--;
+        }
+        taskStats.loggedIn++;
+        
+        // ⚠️ 记录登录完成时间（到达start session页面的时间）
+        const timer = taskStats.taskTimers.get(task.id);
+        if (timer && timer.pageOpenTime) {
+          timer.loginCompleteTime = Date.now();
+          const loginTime = (timer.loginCompleteTime - timer.pageOpenTime) / 1000; // 转换为秒
+          taskStats.loginTimes.push(loginTime);
+          console.log(`[STATS] 📝 Task ${task.id} logged in (reached "Solve cryptographic challenges" page, Logged In: ${taskStats.loggedIn}, Login Time: ${loginTime.toFixed(2)}s)`);
+        } else {
+          console.log(`[STATS] 📝 Task ${task.id} logged in (reached "Solve cryptographic challenges" page, Logged In: ${taskStats.loggedIn})`);
+        }
+      }
+    }
+    
     // 点击 Start 按钮（多种策略，失败也不抛出错误，因为监控脚本会在后台自动处理）
     let startClicked = false;
     const startBtn = page.locator('button:has-text("Start")').first();
@@ -3399,6 +3703,18 @@ async function runOne(task, options = {}) {
     
     if (await startBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
       try {
+        // ⚠️ 点击start按钮前，离开"已登录状态"，记录挖矿开始时间
+        if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+          if (taskStats.loggedIn > 0) {
+            taskStats.loggedIn--;
+          }
+          
+          // ⚠️ 记录挖矿开始时间（点击start按钮的时间）
+          const timer = taskStats.taskTimers.get(task.id);
+          if (timer) {
+            timer.miningStartTime = Date.now();
+          }
+        }
         await safeClick(page, startBtn, { timeout: 10000, force: true, retries: 3 });
         console.log('[DEBUG] Start button clicked successfully!');
         startClicked = true;
@@ -3410,6 +3726,18 @@ async function runOne(task, options = {}) {
     if (!startClicked) {
       // 尝试用 role 定位
       try {
+        // ⚠️ 点击start按钮前（如果还未点击），离开"已登录状态"，记录挖矿开始时间
+        if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+          if (taskStats.loggedIn > 0 && !startClicked) {
+            taskStats.loggedIn--;
+          }
+          
+          // ⚠️ 记录挖矿开始时间（点击start按钮的时间）
+          const timer = taskStats.taskTimers.get(task.id);
+          if (timer && !timer.miningStartTime) {
+            timer.miningStartTime = Date.now();
+          }
+        }
         const startBtnRole = page.getByRole('button', { name: /^start$/i });
         await safeClick(page, startBtnRole, { timeout: 10000, force: true, retries: 3 });
         console.log('[DEBUG] Start button clicked via role!');
@@ -3476,8 +3804,86 @@ async function runOne(task, options = {}) {
         
         if (hasSession) {
           console.log('[SESSION-CHECK] ✓ Mining session established successfully (Start/Stop buttons found)');
-          // 已经有 session，任务成功，不需要检查 Terms 页面
-          return;
+          // ⚠️ 重要：有 session 不代表任务完成，需要检查状态
+          // 只有当状态显示为 "waiting for the next challenge" 时，task 才算作 completed
+          // 如果状态是 "finding a solution"，表示正在挖矿，需要继续等待
+          
+          // 检查当前状态
+          const currentStatus = await page.evaluate(() => {
+            const bodyText = (document.body?.innerText || '').toLowerCase();
+            if (bodyText.includes('waiting for the next challenge')) {
+              return 'waiting for the next challenge'; // ✅ 任务已完成
+            } else if (bodyText.includes('finding a solution') || bodyText.includes('finding')) {
+              return 'finding a solution'; // ⛏️ 任务正在进行中（挖矿中）
+            }
+            return 'unknown';
+          }).catch(() => 'unknown');
+          
+          if (currentStatus === 'waiting for the next challenge') {
+            // ⚠️ 记录挖矿完成时间（状态变成waiting for the next challenge的时间）
+            if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+              const timer = taskStats.taskTimers.get(task.id);
+              if (timer && timer.miningStartTime && !timer.miningCompleteRecorded) {
+                const miningCompleteTime = Date.now();
+                const miningTime = (miningCompleteTime - timer.miningStartTime) / 1000; // 转换为秒
+                taskStats.miningTimes.push(miningTime);
+                timer.miningCompleteRecorded = true; // 标记已记录，避免重复记录
+                console.log(`[SESSION-CHECK] ✓ Task ${task.id} completed: Status is "waiting for the next challenge" (Mining Time: ${miningTime.toFixed(2)}s)`);
+              } else {
+                console.log('[SESSION-CHECK] ✓ Task completed: Status is "waiting for the next challenge"');
+              }
+            } else {
+              console.log('[SESSION-CHECK] ✓ Task completed: Status is "waiting for the next challenge"');
+            }
+            return; // 任务已完成
+          } else if (currentStatus === 'finding a solution') {
+            console.log('[SESSION-CHECK] ⏳ Task is mining: Status is "finding a solution", waiting for "waiting for the next challenge"...');
+            console.log('[SESSION-CHECK] ℹ️ No timeout set - will wait until status changes (mining difficulty varies by cycle)');
+            // ⚠️ 更新统计：任务已开始挖矿
+            if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+              taskStats.miningStarted++;
+              console.log(`[STATS] ⛏️ Task ${task.id} started mining (Active Mining: ${taskStats.miningStarted})`);
+            }
+            // ⚠️ 不设置超时时间，因为不同周期的挖矿难度不一样，可能很快也可能很慢
+            // 持续等待直到状态变成 "waiting for the next challenge"
+            // 使用轮询方式持续检查状态（每2秒检查一次）
+            while (true) {
+              const status = await page.evaluate(() => {
+                const bodyText = (document.body?.innerText || '').toLowerCase();
+                return bodyText.includes('waiting for the next challenge') ? 'completed' : 
+                       (bodyText.includes('finding a solution') || bodyText.includes('finding')) ? 'mining' : 'unknown';
+              }).catch(() => 'unknown');
+              
+              if (status === 'completed') {
+                // ⚠️ 记录挖矿完成时间（状态变成waiting for the next challenge的时间）
+                if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+                  const timer = taskStats.taskTimers.get(task.id);
+                  if (timer && timer.miningStartTime && !timer.miningCompleteRecorded) {
+                    const miningCompleteTime = Date.now();
+                    const miningTime = (miningCompleteTime - timer.miningStartTime) / 1000; // 转换为秒
+                    taskStats.miningTimes.push(miningTime);
+                    timer.miningCompleteRecorded = true; // 标记已记录，避免重复记录
+                    console.log(`[SESSION-CHECK] ✓ Task ${task.id} completed: Status changed to "waiting for the next challenge" (Mining Time: ${miningTime.toFixed(2)}s)`);
+                  } else {
+                    console.log('[SESSION-CHECK] ✓ Task completed: Status changed to "waiting for the next challenge"');
+                  }
+                } else {
+                  console.log('[SESSION-CHECK] ✓ Task completed: Status changed to "waiting for the next challenge"');
+                }
+                return; // 任务已完成
+              } else if (status !== 'mining') {
+                // 状态异常（既不是mining也不是completed），记录日志但继续等待
+                console.warn(`[SESSION-CHECK] ⚠️ Unexpected status: ${status}, continuing to wait...`);
+              }
+              
+              // 等待2秒后再次检查
+              await page.waitForTimeout(2000);
+            }
+          } else {
+            console.log('[SESSION-CHECK] ✓ Session established, but status unknown. Task initialized successfully.');
+            // session 已建立，虽然没有检测到明确状态，但至少流程走完了
+            return;
+          }
         }
         
         // 如果没有 session，才检查是否还在 Terms 页面
@@ -3519,7 +3925,81 @@ async function runOne(task, options = {}) {
               
               if (hasSessionAfterRetry) {
                 console.log('[SESSION-CHECK] ✓ Mining session established after retry!');
-                return; // 任务成功
+                // ⚠️ 重要：检查状态，只有当状态是 "waiting for the next challenge" 才算完成
+                const currentStatusAfterRetry = await page.evaluate(() => {
+                  const bodyText = (document.body?.innerText || '').toLowerCase();
+                  if (bodyText.includes('waiting for the next challenge')) {
+                    return 'waiting for the next challenge';
+                  } else if (bodyText.includes('finding a solution') || bodyText.includes('finding')) {
+                    return 'finding a solution';
+                  }
+                  return 'unknown';
+                }).catch(() => 'unknown');
+                
+                if (currentStatusAfterRetry === 'waiting for the next challenge') {
+                  // ⚠️ 记录挖矿完成时间（重试后状态是waiting for the next challenge）
+                  if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+                    const timer = taskStats.taskTimers.get(task.id);
+                    if (timer && timer.miningStartTime && !timer.miningCompleteRecorded) {
+                      const miningCompleteTime = Date.now();
+                      const miningTime = (miningCompleteTime - timer.miningStartTime) / 1000; // 转换为秒
+                      taskStats.miningTimes.push(miningTime);
+                      timer.miningCompleteRecorded = true;
+                      console.log(`[SESSION-CHECK] ✓ Task ${task.id} completed after retry: Status is "waiting for the next challenge" (Mining Time: ${miningTime.toFixed(2)}s)`);
+                    } else {
+                      console.log('[SESSION-CHECK] ✓ Task completed after retry: Status is "waiting for the next challenge"');
+                    }
+                  } else {
+                    console.log('[SESSION-CHECK] ✓ Task completed after retry: Status is "waiting for the next challenge"');
+                  }
+                  return; // 任务已完成
+                } else if (currentStatusAfterRetry === 'finding a solution') {
+                  console.log('[SESSION-CHECK] ⏳ Task is mining after retry: Status is "finding a solution", waiting for "waiting for the next challenge"...');
+                  console.log('[SESSION-CHECK] ℹ️ No timeout set - will wait until status changes (mining difficulty varies by cycle)');
+                  // ⚠️ 更新统计：任务已开始挖矿
+                  if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+                    taskStats.miningStarted++;
+                    console.log(`[STATS] ⛏️ Task ${task.id} started mining after retry (Active Mining: ${taskStats.miningStarted})`);
+                  }
+                  // ⚠️ 不设置超时时间，因为不同周期的挖矿难度不一样，可能很快也可能很慢
+                  // 持续等待直到状态变成 "waiting for the next challenge"
+                  // 使用轮询方式持续检查状态（每2秒检查一次）
+                  while (true) {
+                    const status = await page.evaluate(() => {
+                      const bodyText = (document.body?.innerText || '').toLowerCase();
+                      return bodyText.includes('waiting for the next challenge') ? 'completed' : 
+                             (bodyText.includes('finding a solution') || bodyText.includes('finding')) ? 'mining' : 'unknown';
+                    }).catch(() => 'unknown');
+                    
+                    if (status === 'completed') {
+                      // ⚠️ 记录挖矿完成时间（重试后轮询中状态变成waiting for the next challenge）
+                      if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+                        const timer = taskStats.taskTimers.get(task.id);
+                        if (timer && timer.miningStartTime && !timer.miningCompleteRecorded) {
+                          const miningCompleteTime = Date.now();
+                          const miningTime = (miningCompleteTime - timer.miningStartTime) / 1000; // 转换为秒
+                          taskStats.miningTimes.push(miningTime);
+                          timer.miningCompleteRecorded = true;
+                          console.log(`[SESSION-CHECK] ✓ Task ${task.id} completed after retry: Status changed to "waiting for the next challenge" (Mining Time: ${miningTime.toFixed(2)}s)`);
+                        } else {
+                          console.log('[SESSION-CHECK] ✓ Task completed after retry: Status changed to "waiting for the next challenge"');
+                        }
+                      } else {
+                        console.log('[SESSION-CHECK] ✓ Task completed after retry: Status changed to "waiting for the next challenge"');
+                      }
+                      return; // 任务已完成
+                    } else if (status !== 'mining') {
+                      // 状态异常（既不是mining也不是completed），记录日志但继续等待
+                      console.warn(`[SESSION-CHECK] ⚠️ Unexpected status after retry: ${status}, continuing to wait...`);
+                    }
+                    
+                    // 等待2秒后再次检查
+                    await page.waitForTimeout(2000);
+                  }
+                } else {
+                  console.log('[SESSION-CHECK] ✓ Session established after retry, but status unknown. Task initialized successfully.');
+                  return; // session 已建立，至少流程走完了
+                }
               }
               
               // 再次检查是否还在 Terms 页面
@@ -3564,13 +4044,74 @@ async function runOne(task, options = {}) {
       }
     };
     
-    // 检查是否建立了挖矿 session
-    await checkMiningSessionEstablished();
-
-    // 如果只是初始化模式，注册到scheduler并返回（不注入自动启动监控）
+    // ⚠️ 如果只是初始化模式，跳过session完成检查，直接注册到scheduler
     if (initOnly && scheduler) {
-      console.log(`[INIT] Task ${task.id} initialized, registering with scheduler (not starting mining)`);
-      await scheduler.addTask(task.id, page, browser);
+      // 验证是否已到达"Solve cryptographic challenges"页面（有start session按钮）
+      const hasStartButton = await page.evaluate(() => {
+        const bodyText = (document.body?.innerText || '').toLowerCase();
+        // 检查是否显示"Solve cryptographic challenges"
+        const hasSolveCryptoText = bodyText.includes('solve cryptographic challenges');
+        
+        if (!hasSolveCryptoText) {
+          return false;
+        }
+        
+        // 检查是否有start session按钮
+        const allButtons = Array.from(document.querySelectorAll('button'));
+        const hasStart = allButtons.some(b => {
+          const text = b.textContent?.trim().toLowerCase();
+          return (text === 'start' || text === 'start session') && b.offsetParent !== null && !b.disabled;
+        });
+        return hasStart;
+      }).catch(() => false);
+      
+      if (hasStartButton) {
+        console.log(`[INIT] Task ${task.id} initialized, registering with scheduler (not starting mining)`);
+        await scheduler.addTask(task.id, page, browser);
+      } else {
+        // 如果还没有到达start session页面，等待并检查一次session状态（但不等待完成）
+        console.log(`[INIT] Task ${task.id} not yet at start session page, checking session establishment...`);
+        // 只检查session是否建立，不等待完成
+        const sessionEstablished = await page.evaluate(() => {
+          const allButtons = Array.from(document.querySelectorAll('button'));
+          const hasStart = allButtons.some(b => {
+            const text = b.textContent?.trim().toLowerCase();
+            return (text === 'start' || text === 'start session') && b.offsetParent !== null;
+          });
+          const hasStop = allButtons.some(b => {
+            const text = b.textContent?.trim().toLowerCase();
+            return (text === 'stop' || text === 'stop session') && b.offsetParent !== null;
+          });
+          return hasStart || hasStop;
+        }).catch(() => false);
+        
+        if (sessionEstablished) {
+          console.log(`[INIT] Task ${task.id} initialized (session established), registering with scheduler (not starting mining)`);
+          await scheduler.addTask(task.id, page, browser);
+        } else {
+          // 如果session还没建立，等待一小段时间后再次检查
+          await page.waitForTimeout(3000);
+          const sessionEstablishedAfterWait = await page.evaluate(() => {
+            const allButtons = Array.from(document.querySelectorAll('button'));
+            const hasStart = allButtons.some(b => {
+              const text = b.textContent?.trim().toLowerCase();
+              return (text === 'start' || text === 'start session') && b.offsetParent !== null;
+            });
+            const hasStop = allButtons.some(b => {
+              const text = b.textContent?.trim().toLowerCase();
+              return (text === 'stop' || text === 'stop session') && b.offsetParent !== null;
+            });
+            return hasStart || hasStop;
+          }).catch(() => false);
+          
+          if (sessionEstablishedAfterWait) {
+            console.log(`[INIT] Task ${task.id} initialized (session established after wait), registering with scheduler (not starting mining)`);
+            await scheduler.addTask(task.id, page, browser);
+          } else {
+            throw new Error(`Task ${task.id} failed to establish session during initialization`);
+          }
+        }
+      }
       // 标记任务为READY状态
       const taskData = scheduler.tasks.get(task.id);
       if (taskData) {
@@ -3852,11 +4393,23 @@ const taskStats = {
   completed: 0,
   success: 0,
   failed: 0,
+  miningStarted: 0, // 已开始挖矿的任务数（状态为"finding a solution"）
+  loggingIn: 0, // 登录阶段：页面已打开但还未到达start session页面
+  loggedIn: 0, // 已登录状态：已到达start session页面但还未点击start按钮
+  loginTimes: [], // 登录时间数组（从打开页面到start session页面的时间，单位：秒）
+  miningTimes: [], // 挖矿时间数组（从点击start session到状态变成waiting的时间，单位：秒）
+  taskTimers: new Map(), // 每个任务的时间记录 { taskId: { pageOpenTime, loginCompleteTime, miningStartTime } }
   lastUpdateTime: Date.now(),
 };
 
 // 定期输出统计信息
+// ⚠️ 在调度器模式下，这个统计信息不应该输出（调度器有自己的状态报告）
 function logTaskStats() {
+  // 如果是在调度器模式下运行，不输出统计信息（调度器有自己的状态报告）
+  if (process.env.SCHEDULED_MODE === 'true' || process.env.RUN_SCHEDULED === 'true') {
+    return; // 调度器模式下禁用此统计输出
+  }
+  
   const now = Date.now();
   const elapsed = Math.floor((now - taskStats.lastUpdateTime) / 1000);
   const successRate = taskStats.completed > 0 ? (taskStats.success / taskStats.completed * 100).toFixed(1) : '0.0';
@@ -3866,10 +4419,25 @@ function logTaskStats() {
   console.log(`[STATS] Task Statistics (updated every 10 seconds)`);
   console.log(`  Total Tasks: ${taskStats.total}`);
   console.log(`  Completed: ${taskStats.completed} (${successRate}% success)`);
-  console.log(`  ✓ Success (Mining Started): ${taskStats.success}`);
+  console.log(`  ✓ Success (Completed): ${taskStats.success}`);
   console.log(`  ✗ Failed: ${taskStats.failed}`);
   console.log(`  Remaining: ${remaining}`);
-  console.log(`  Active Mining: ${taskStats.success}`);
+  console.log(`  🔐 Logging In (before start session page): ${taskStats.loggingIn}`);
+  console.log(`  📝 Logged In (at start session page): ${taskStats.loggedIn}`);
+  // 当前正在挖矿的任务数 = 已开始挖矿的 - 已完成的
+  const currentlyMining = Math.max(0, taskStats.miningStarted - taskStats.success);
+  console.log(`  ⛏️ Active Mining (currently mining): ${currentlyMining}`);
+  
+  // ⚠️ 计算并显示平均登录时间和平均挖矿时间
+  const avgLoginTime = taskStats.loginTimes.length > 0 
+    ? (taskStats.loginTimes.reduce((sum, t) => sum + t, 0) / taskStats.loginTimes.length).toFixed(2)
+    : '0.00';
+  const avgMiningTime = taskStats.miningTimes.length > 0
+    ? (taskStats.miningTimes.reduce((sum, t) => sum + t, 0) / taskStats.miningTimes.length).toFixed(2)
+    : '0.00';
+  console.log(`  📊 Avg Login Time: ${avgLoginTime}s (from ${taskStats.loginTimes.length} tasks)`);
+  console.log(`  📊 Avg Mining Time: ${avgMiningTime}s (from ${taskStats.miningTimes.length} tasks)`);
+  
   console.log(`  Last Update: ${elapsed}s ago`);
   console.log('='.repeat(60) + '\n');
 }
@@ -3884,6 +4452,12 @@ async function runWithConcurrency() {
   taskStats.completed = 0;
   taskStats.success = 0;
   taskStats.failed = 0;
+  taskStats.miningStarted = 0;
+  taskStats.loggingIn = 0;
+  taskStats.loggedIn = 0;
+  taskStats.loginTimes = [];
+  taskStats.miningTimes = [];
+  taskStats.taskTimers.clear();
   taskStats.lastUpdateTime = Date.now();
   
   // 启动定期统计输出（每10秒）
@@ -3891,8 +4465,10 @@ async function runWithConcurrency() {
     logTaskStats();
   }, 10000);
   
-  // 初始输出
-  console.log(`[STATS] Starting ${taskStats.total} tasks with concurrency ${CONCURRENCY}`);
+  // 初始输出（只在非调度器模式下）
+  if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+    console.log(`[STATS] Starting ${taskStats.total} tasks with concurrency ${CONCURRENCY}`);
+  }
 
   return new Promise((resolve) => {
     const launchNext = () => {
@@ -3906,22 +4482,52 @@ async function runWithConcurrency() {
       while (running < CONCURRENCY && queue.length > 0) {
         const task = queue.shift();
         running++;
-        const p = Promise.race([
-          runOne(task),
-          new Promise(res => setTimeout(() => res({ id: task.id, ok: false, error: 'timeout' }), TASK_TIMEOUT_MS))
-        ]);
+        // ⚠️ 不设置超时，因为挖矿任务需要在点击start session后等待状态变成"waiting for the next challenge"才算完成
+        // 不同周期的挖矿难度不一样，可能很快也可能很慢
+        const p = runOne(task);
         p.then(r => {
           results.push(r);
           taskStats.completed++;
+          
           if (r.ok) {
             taskStats.success++;
-            console.log(`[STATS] ✓ Task ${r.id} completed successfully (Total: ${taskStats.success}/${taskStats.total})`);
+            // 只在非调度器模式下输出详细日志
+            if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+              console.log(`[STATS] ✓ Task ${r.id} completed successfully (Total: ${taskStats.success}/${taskStats.total})`);
+            }
           } else {
             taskStats.failed++;
-            console.log(`[STATS] ✗ Task ${r.id} failed: ${r.error?.substring(0, 50) || 'unknown error'} (Failed: ${taskStats.failed}/${taskStats.total})`);
+            // 只在非调度器模式下输出详细日志
+            if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+              console.log(`[STATS] ✗ Task ${r.id} failed: ${r.error?.substring(0, 50) || 'unknown error'} (Failed: ${taskStats.failed}/${taskStats.total})`);
+            }
           }
-          // 每完成一个任务也更新统计
-          if (taskStats.completed % 5 === 0 || taskStats.completed === taskStats.total) {
+          
+          // ⚠️ 任务完成或失败时，清理状态计数
+          if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+            // 检查任务是否在挖矿中（通过检查taskTimers）
+            const timer = taskStats.taskTimers.get(r.id);
+            const wasMining = timer && timer.miningStartTime && !timer.miningCompleteRecorded;
+            
+            // 清理状态计数
+            if (taskStats.loggingIn > 0) {
+              taskStats.loggingIn--;
+            }
+            if (taskStats.loggedIn > 0) {
+              taskStats.loggedIn--;
+            }
+            // ⚠️ 如果任务已经开始挖矿（无论成功还是失败），都需要清理miningStarted计数
+            // 因为任务完成了（成功）或失败了，不再处于挖矿状态
+            if (wasMining && taskStats.miningStarted > 0) {
+              taskStats.miningStarted--;
+            }
+            
+            // 清理任务时间记录
+            taskStats.taskTimers.delete(r.id);
+          }
+          // 每完成一个任务也更新统计（只在非调度器模式下）
+          if ((process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') && 
+              (taskStats.completed % 5 === 0 || taskStats.completed === taskStats.total)) {
             logTaskStats();
           }
         })
@@ -3929,7 +4535,33 @@ async function runWithConcurrency() {
            results.push({ id: task.id, ok: false, error: String(e) });
            taskStats.completed++;
            taskStats.failed++;
-           console.log(`[STATS] ✗ Task ${task.id} error: ${String(e).substring(0, 50)} (Failed: ${taskStats.failed}/${taskStats.total})`);
+           
+           // ⚠️ 任务失败时，清理状态计数
+           if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+             // 检查任务是否在挖矿中（通过检查taskTimers）
+             const timer = taskStats.taskTimers.get(task.id);
+             const wasMining = timer && timer.miningStartTime && !timer.miningCompleteRecorded;
+             
+             // 清理状态计数
+             if (taskStats.loggingIn > 0) {
+               taskStats.loggingIn--;
+             }
+             if (taskStats.loggedIn > 0) {
+               taskStats.loggedIn--;
+             }
+             // ⚠️ 如果任务失败但已经开始挖矿，需要清理miningStarted计数
+             if (wasMining && taskStats.miningStarted > 0) {
+               taskStats.miningStarted--;
+             }
+             
+             // 清理任务时间记录
+             taskStats.taskTimers.delete(task.id);
+           }
+           
+           // 只在非调度器模式下输出详细日志
+           if (process.env.SCHEDULED_MODE !== 'true' && process.env.RUN_SCHEDULED !== 'true') {
+             console.log(`[STATS] ✗ Task ${task.id} error: ${String(e).substring(0, 50)} (Failed: ${taskStats.failed}/${taskStats.total})`);
+           }
          })
          .finally(() => {
            running--;
@@ -3947,14 +4579,18 @@ export { runOne, runOneInitOnly, loadTasks };
 
 // 如果不是被导入，则运行默认流程
 // 检查是否是直接运行的脚本（不是被import）
+// ⚠️ 在调度器模式下（SCHEDULED_MODE 或 RUN_SCHEDULED），不执行 runWithConcurrency
 const isMainModule = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
-if (isMainModule || !process.env.SCHEDULED_MODE) {
-runWithConcurrency().then(res => {
-  console.log('Done:', res);
-  const failed = res.filter(r => !r.ok);
-  if (failed.length) {
-    console.error('Failed:', failed);
-    process.exitCode = 1;
-  }
-});
+const isScheduledMode = process.env.SCHEDULED_MODE === 'true' || process.env.RUN_SCHEDULED === 'true';
+
+// 只在直接运行脚本且非调度器模式下才执行 runWithConcurrency
+if (isMainModule && !isScheduledMode) {
+  runWithConcurrency().then(res => {
+    console.log('Done:', res);
+    const failed = res.filter(r => !r.ok);
+    if (failed.length) {
+      console.error('Failed:', failed);
+      process.exitCode = 1;
+    }
+  });
 }
